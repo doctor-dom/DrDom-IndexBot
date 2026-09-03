@@ -44,9 +44,9 @@ export async function writeErrorLog({phase, message}) {
   }
 }
 
-export async function writeLastRun({layout, message, inserted, titleCount}) {
+export async function writeLastRun({layout, mode, snapBack, message, inserted, titleCount}) {
   const stamp = new Date().toISOString();
-  const line = `${stamp} ok layout=${layout || 'compact'} titles=${titleCount ?? 0} inserted=${inserted ?? 0} ${message || ''}\n`;
+  const line = `${stamp} ok mode=${mode || 'initial'} layout=${layout || 'compact'} snapBack=${snapBack ? 1 : 0} titles=${titleCount ?? 0} inserted=${inserted ?? 0} ${message || ''}\n`;
 
   try {
     await ensureDir();

@@ -1,33 +1,39 @@
 ﻿# IndexBot
 
-Supernote NOTE plugin that builds an editable **Table of Contents** from native Title headings, with jump links on the current page.
+Supernote NOTE plugin that builds an editable **Table of Contents** from native Title headings, with jump links on page 1.
 
 ## Use
 
-1. Mark headings in your note with the **Title** tool (H1–H4 styles set hierarchy).
-2. Go to the page where you want the ToC.
-3. Tap **IndexBot** in the note sidebar.
-4. Pick a layout — **Outline**, **Compact**, **Numbered**, or **Flat** — then **Generate ToC**.
+### First run
 
-On success the plugin closes and the ToC appears on the current page. Each row has an editable title and a tappable leader link (`.... →`) that jumps to the heading’s page.
+1. Mark headings with the **Title** tool (H1–H4 styles set hierarchy).
+2. Go to **page 1** — it must be **blank**.
+3. Tap **IndexBot** in the note sidebar.
+4. Pick a layout, optionally enable **Snap-back links**, then **Generate ToC**.
+
+### Refresh (update existing ToC)
+
+If a ToC is already on page 1, you can run IndexBot from **any page**. It re-scans the note and replaces the ToC on page 1.
 
 ## Layouts
 
 | Layout | Description |
 |--------|-------------|
-| **Outline** | Bullets (`•` / `◦` / `-`) and indent by level; H1 bold |
+| **Outline** | Bullets and indent by level; H1 bold |
 | **Compact** | Indented hierarchy with leader dots (default) |
-| **Numbered** | `1.` / `1.1` / `1.1.1` with indent by level |
+| **Numbered** | `1.` / `1.1` / `1.1.1` with indent |
 | **Flat** | Single level, no indent |
 
-No page numbers are printed in any layout.
+## Snap-back links (optional)
+
+When enabled, each page with a heading gets a small **← ToC** link (top-right) back to page 1. On refresh, links are updated and removed from pages that no longer have headings.
 
 ## Device logs (USB)
 
 | File | When |
 |------|------|
-| `MyStyle/IndexBot/indexbot-last-run.txt` | Last successful run (one line) |
-| `MyStyle/IndexBot/indexbot-error.log` | Last failed run (full debug dump) |
+| `MyStyle/IndexBot/indexbot-last-run.txt` | Last successful run |
+| `MyStyle/IndexBot/indexbot-error.log` | Last failed run |
 
 ## Build
 
@@ -37,7 +43,7 @@ From the home-base repo root:
 npm run snplg -- IndexBot
 ```
 
-Output: `dist/indexbot/IndexBot.snplg` (native pack for on-device logging).
+Output: `dist/indexbot/IndexBot.snplg`
 
 ## SDK reference
 

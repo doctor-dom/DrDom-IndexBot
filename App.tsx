@@ -3,21 +3,32 @@
  * @format
  */
 
-import React, {useCallback, useState} from 'react';
+import React, {useCallback, useEffect, useState} from 'react';
 import {
   ActivityIndicator,
   Pressable,
   ScrollView,
   StatusBar,
   StyleSheet,
+  Switch,
   Text,
   View,
 } from 'react-native';
 import {runIndexBotSafe} from './src/toc/runIndexBot';
+import {checkInsertPage} from './src/toc/checkInsertPage';
 import {closePlugin} from './src/utils/closePlugin';
+
 type LayoutMode = 'outline' | 'compact' | 'numbered' | 'flat';
+type RunMode = 'initial' | 'refresh';
 
 type Phase = 'pick' | 'running' | 'error';
+
+type PreflightState = {
+  ready: boolean;
+  mode: RunMode;
+  message: string;
+  loading: boolean;
+};
 
 const LAYOUT_OPTIONS: {id: LayoutMode; label: string; hint: string}[] = [
   {
@@ -38,19 +49,50 @@ const LAYOUT_OPTIONS: {id: LayoutMode; label: string; hint: string}[] = [
   {id: 'flat', label: 'Flat', hint: 'Single level, no indent'},
 ];
 
+const WARNING_INITIAL =
+  'Place the Table of Contents on page 1 of your note. Go to a blank first page before generating.';
+
+const WARNING_REFRESH =
+  'An IndexBot ToC exists on page 1. Generate will re-scan the note and update it. You can run this from any page.';
+
 function App(): React.JSX.Element {
   const [phase, setPhase] = useState<Phase>('pick');
   const [layout, setLayout] = useState<LayoutMode>('compact');
+  const [snapBack, setSnapBack] = useState(false);
   const [statusText, setStatusText] = useState('');
   const [errorText, setErrorText] = useState('');
+  const [preflight, setPreflight] = useState<PreflightState>({
+    ready: false,
+    mode: 'initial',
+    message: 'Checking page…',
+    loading: true,
+  });
+
+  const refreshPreflight = useCallback(async () => {
+    setPreflight(p => ({...p, loading: true, message: 'Checking page…'}));
+    const result = await checkInsertPage();
+    setPreflight({
+      ready: result.ready,
+      mode: result.mode as RunMode,
+      message: result.message,
+      loading: false,
+    });
+  }, []);
+
+  useEffect(() => {
+    refreshPreflight();
+  }, [refreshPreflight]);
 
   const handleGenerate = useCallback(async () => {
+    if (!preflight.ready) return;
+
     setPhase('running');
     setStatusText('Starting…');
     setErrorText('');
 
     const result = await runIndexBotSafe({
       layout,
+      snapBack,
       onStatus: status => {
         if (status?.message) {
           setStatusText(status.message);
@@ -65,7 +107,12 @@ function App(): React.JSX.Element {
 
     setErrorText(result.message || 'Generation failed.');
     setPhase('error');
-  }, [layout]);
+  }, [layout, snapBack, preflight.ready]);
+
+  const handleBackFromError = useCallback(() => {
+    setPhase('pick');
+    refreshPreflight();
+  }, [refreshPreflight]);
 
   if (phase === 'running') {
     return (
@@ -87,12 +134,18 @@ function App(): React.JSX.Element {
         <Text style={styles.hint}>
           Details: MyStyle/IndexBot/indexbot-error.log
         </Text>
-        <Pressable style={styles.btnPrimary} onPress={closePlugin}>
-          <Text style={styles.btnPrimaryText}>Done</Text>
+        <Pressable style={styles.btnPrimary} onPress={handleBackFromError}>
+          <Text style={styles.btnPrimaryText}>Back</Text>
+        </Pressable>
+        <Pressable style={[styles.btnSecondary, {marginTop: 12}]} onPress={closePlugin}>
+          <Text style={styles.btnSecondaryText}>Done</Text>
         </Pressable>
       </View>
     );
   }
+
+  const warningText =
+    preflight.mode === 'refresh' ? WARNING_REFRESH : WARNING_INITIAL;
 
   return (
     <ScrollView
@@ -102,6 +155,13 @@ function App(): React.JSX.Element {
       <Text style={styles.title}>IndexBot</Text>
       <Text style={styles.subtitle}>Choose a table of contents style</Text>
 
+      <View style={styles.warningBox}>
+        <Text style={styles.warningText}>{warningText}</Text>
+        <Text style={styles.statusText}>
+          {preflight.loading ? 'Checking page…' : preflight.message}
+        </Text>
+      </View>
+
       {LAYOUT_OPTIONS.map(opt => {
         const selected = layout === opt.id;
         return (
@@ -109,7 +169,11 @@ function App(): React.JSX.Element {
             key={opt.id}
             style={[styles.option, selected && styles.optionSelected]}
             onPress={() => setLayout(opt.id)}>
-            <Text style={[styles.optionLabel, selected && styles.optionLabelSelected]}>
+            <Text
+              style={[
+                styles.optionLabel,
+                selected && styles.optionLabelSelected,
+              ]}>
               {opt.label}
             </Text>
             <Text style={styles.optionHint}>{opt.hint}</Text>
@@ -117,7 +181,28 @@ function App(): React.JSX.Element {
         );
       })}
 
-      <Pressable style={styles.btnPrimary} onPress={handleGenerate}>
+      <View style={styles.toggleRow}>
+        <View style={styles.toggleTextCol}>
+          <Text style={styles.toggleLabel}>Snap-back links</Text>
+          <Text style={styles.optionHint}>
+            Add a ← ToC link on each heading page back to page 1
+          </Text>
+        </View>
+        <Switch
+          value={snapBack}
+          onValueChange={setSnapBack}
+          trackColor={{false: '#cccccc', true: '#000000'}}
+          thumbColor="#ffffff"
+        />
+      </View>
+
+      <Pressable
+        style={[
+          styles.btnPrimary,
+          (!preflight.ready || preflight.loading) && styles.btnDisabled,
+        ]}
+        onPress={handleGenerate}
+        disabled={!preflight.ready || preflight.loading}>
         <Text style={styles.btnPrimaryText}>Generate ToC</Text>
       </Pressable>
     </ScrollView>
@@ -150,8 +235,26 @@ const styles = StyleSheet.create({
   subtitle: {
     fontSize: 18,
     color: '#000000',
-    marginBottom: 20,
+    marginBottom: 16,
     textAlign: 'center',
+  },
+  warningBox: {
+    borderWidth: 2,
+    borderColor: '#000000',
+    padding: 16,
+    marginBottom: 20,
+    backgroundColor: '#ffffff',
+  },
+  warningText: {
+    fontSize: 17,
+    color: '#000000',
+    marginBottom: 10,
+    lineHeight: 24,
+  },
+  statusText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#000000',
   },
   body: {
     fontSize: 18,
@@ -190,6 +293,25 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#000000',
   },
+  toggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 2,
+    borderColor: '#000000',
+    padding: 16,
+    marginBottom: 12,
+    backgroundColor: '#ffffff',
+  },
+  toggleTextCol: {
+    flex: 1,
+    paddingRight: 12,
+  },
+  toggleLabel: {
+    fontSize: 20,
+    fontWeight: '600',
+    color: '#000000',
+    marginBottom: 4,
+  },
   btnPrimary: {
     marginTop: 12,
     borderWidth: 2,
@@ -199,10 +321,27 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
     alignItems: 'center',
   },
+  btnDisabled: {
+    backgroundColor: '#888888',
+    borderColor: '#888888',
+  },
   btnPrimaryText: {
     fontSize: 20,
     fontWeight: '700',
     color: '#ffffff',
+  },
+  btnSecondary: {
+    borderWidth: 2,
+    borderColor: '#000000',
+    backgroundColor: '#ffffff',
+    paddingVertical: 14,
+    paddingHorizontal: 24,
+    alignItems: 'center',
+  },
+  btnSecondaryText: {
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#000000',
   },
 });
 

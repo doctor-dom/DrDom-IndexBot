@@ -9,13 +9,21 @@ import {PluginCommAPI, PluginFileAPI, PluginNoteAPI} from 'sn-plugin-lib';
 import {log} from '../utils/debug';
 import {toHostPageIndex} from '../utils/pageIndex';
 import {normalizeLayout} from './layoutModes';
+import {
+  isIndexBotTocLink,
+  LINK_SENTINEL,
+  JUMP_SHOW,
+  TOC_HEADER,
+  textBoxFirstLine,
+  textBoxRect,
+  linkRect,
+  rectsOverlap,
+  clusterBounds,
+} from './tocMarkers';
+
+export {LINK_SENTINEL, JUMP_SHOW, TOC_HEADER};
 
 const TAG = 'Insert';
-
-/** Hidden identity in link fullText only — never shown in text boxes. */
-export const LINK_SENTINEL = '→<!--indexbot-toc-->';
-export const JUMP_SHOW = '→';
-export const TOC_HEADER = 'Table of Contents';
 
 const TYPE_TEXT = 500;
 const TYPE_LINK = 600;
@@ -181,55 +189,66 @@ function samplePrefixForWidth(heading, layout, numbering) {
   return buildTitlePrefix(heading, layout, numbering);
 }
 
-function isIndexBotLink(el) {
-  if (el?.type !== TYPE_LINK) return false;
-  const full = el.link?.fullText || '';
-  return full.includes('indexbot-toc') || full.includes('<!--indexbot-toc-->');
-}
-
-function textBoxFirstLine(el) {
-  const content = el?.textBox?.textContentFull || '';
-  return content.split(/\r?\n/)[0] || '';
-}
-
-function textBoxRect(el) {
-  const r = el?.textBox?.textRect;
-  if (r && typeof r.left === 'number') return r;
-  return null;
-}
-
-function linkRect(el) {
-  const L = el?.link;
-  if (!L) return null;
-  if (typeof L.X === 'number' && typeof L.width === 'number') {
-    return {
-      left: L.X,
-      top: L.Y,
-      right: L.X + L.width,
-      bottom: L.Y + (L.height || 0),
-    };
-  }
-  return null;
-}
-
-function rectsOverlap(a, b, pad = 24) {
-  if (!a || !b) return false;
-  return !(
-    a.right < b.left - pad ||
-    a.left > b.right + pad ||
-    a.bottom < b.top - pad ||
-    a.top > b.bottom + pad
+async function createSdkElement(type) {
+  const res = await withTimeout(
+    PluginCommAPI.createElement(type),
+    10000,
+    `createElement(${type})`,
   );
+  if (!res?.success || !res.result) {
+    throw new Error(
+      `createElement(${type}) failed: ${res?.error?.message || 'unknown'}`,
+    );
+  }
+  return res.result;
 }
 
-function clusterBounds(rects) {
-  if (!rects.length) return null;
-  return {
-    left: Math.min(...rects.map(r => r.left)),
-    top: Math.min(...rects.map(r => r.top)),
-    right: Math.max(...rects.map(r => r.right)),
-    bottom: Math.max(...rects.map(r => r.bottom)),
+function applyTextBox(el, pageNum, text, rect, fontSize, textBold) {
+  el.type = TYPE_TEXT;
+  el.pageNum = toHostPageIndex(pageNum);
+  el.layerNum = 0;
+  el.textBox = {
+    fontSize,
+    textContentFull: text,
+    textRect: {
+      left: Math.round(rect.left),
+      top: Math.round(rect.top),
+      right: Math.round(rect.right),
+      bottom: Math.round(rect.bottom),
+    },
+    textAlign: 0,
+    textBold: textBold ? 1 : 0,
+    textItalics: 0,
+    textFrameWidthType: 0,
+    textFrameStyle: 0,
+    textEditable: 0,
   };
+  return el;
+}
+
+function applyLink(el, pageNum, notePath, destPage, rect, fontSize, fullText, showText) {
+  el.type = TYPE_LINK;
+  el.pageNum = toHostPageIndex(pageNum);
+  el.layerNum = 0;
+  const w = Math.round(rect.right - rect.left);
+  const h = Math.round(rect.bottom - rect.top);
+  el.link = {
+    category: 0,
+    X: Math.round(rect.left),
+    Y: Math.round(rect.top),
+    width: w,
+    height: h,
+    page: toHostPageIndex(pageNum),
+    style: 0,
+    linkType: 0,
+    destPath: notePath,
+    destPage: toHostPageIndex(destPage),
+    fontSize,
+    fullText,
+    showText,
+    italic: 0,
+  };
+  return el;
 }
 
 function computeBlockWidth(headings, fonts, pageWidth, layout) {
@@ -380,7 +399,7 @@ async function stripPreviousToc(notePath, pageNum) {
 
   const linkRects = [];
   for (const el of res.result) {
-    if (isIndexBotLink(el)) {
+    if (isIndexBotTocLink(el)) {
       const r = linkRect(el);
       if (r) linkRects.push(r);
     }
@@ -390,7 +409,7 @@ async function stripPreviousToc(notePath, pageNum) {
   const kept = [];
   let removed = 0;
   for (const el of res.result) {
-    if (isIndexBotLink(el)) {
+    if (isIndexBotTocLink(el)) {
       removed += 1;
       continue;
     }
@@ -569,55 +588,205 @@ async function insertColumn({
   }
 }
 
+async function buildColumnElements({
+  headings,
+  includeHeader,
+  fonts,
+  left,
+  blockW,
+  top,
+  notePath,
+  layout,
+  tocPage,
+}) {
+  const linkRight = left + blockW;
+  const textRight = linkRight - LINK_COL_W - 6;
+  let y = top;
+  const numbering = createNumberingState();
+  const elements = [];
+
+  if (includeHeader) {
+    const fs = fonts.header;
+    const h = lineHeight(fs);
+    const textEl = applyTextBox(
+      await createSdkElement(TYPE_TEXT),
+      tocPage,
+      TOC_HEADER,
+      {left, top: y, right: textRight, bottom: y + h},
+      fs,
+      true,
+    );
+    elements.push(textEl);
+    y += h;
+  }
+
+  for (const heading of headings) {
+    const rowLeft = rowLeftOffset(left, heading, layout);
+    const leaderAreaWidth = Math.max(8, linkRight - rowLeft);
+    const row = buildRowParts(
+      heading,
+      fonts,
+      layout,
+      numbering,
+      leaderAreaWidth,
+    );
+    const titleRight = Math.min(
+      linkRight - LINK_COL_W - 4,
+      rowLeft + Math.ceil(row.titleW) + 8,
+    );
+    const linkLeft = Math.max(titleRight, rowLeft + Math.ceil(row.titleW));
+
+    elements.push(
+      applyTextBox(
+        await createSdkElement(TYPE_TEXT),
+        tocPage,
+        row.titleText,
+        {left: rowLeft, top: y, right: titleRight, bottom: y + row.height},
+        row.fontSize,
+        row.textBold === 1,
+      ),
+    );
+    elements.push(
+      applyLink(
+        await createSdkElement(TYPE_LINK),
+        tocPage,
+        notePath,
+        heading.page,
+        {left: linkLeft, top: y, right: linkRight, bottom: y + row.height},
+        row.fontSize,
+        `${row.leaderText}${LINK_SENTINEL}`,
+        row.leaderText,
+      ),
+    );
+    y += row.height;
+  }
+
+  return elements;
+}
+
+async function insertColumnViaFile({
+  headings,
+  includeHeader,
+  fonts,
+  left,
+  blockW,
+  top,
+  notePath,
+  layout,
+  tocPage,
+  bucket,
+}) {
+  const els = await buildColumnElements({
+    headings,
+    includeHeader,
+    fonts,
+    left,
+    blockW,
+    top,
+    notePath,
+    layout,
+    tocPage,
+  });
+  bucket.push(...els);
+}
+
 /**
- * Strip old ToC and insert new layout on the current page.
+ * Strip old ToC and insert new layout on tocPage (default page 1).
  */
 export async function insertTableOfContents({
   notePath,
+  tocPage = 1,
   currentPage,
   pageSize,
   headings,
   layout: layoutMode = 'compact',
 }) {
   const layout = normalizeLayout(layoutMode);
+  const tocPg = toHostPageIndex(tocPage);
+  const curPg = toHostPageIndex(currentPage ?? tocPg);
+  const insertOnCurrentPage = curPg === tocPg;
 
   await PluginNoteAPI.saveCurrentNote();
-  await stripPreviousToc(notePath, currentPage);
+  await stripPreviousToc(notePath, tocPg);
   await PluginNoteAPI.saveCurrentNote();
 
   const plan = planLayout(headings, pageSize, layout);
   log(
     TAG,
-    `layout=${layout} columns=${plan.columns} fonts.h1=${plan.fonts.h1} blockW=${plan.blockW} left=${plan.left.length} right=${plan.right.length} omitted=${plan.omitted}`,
+    `layout=${layout} tocPage=${tocPg} current=${curPg} fileInsert=${!insertOnCurrentPage} columns=${plan.columns} blockW=${plan.blockW}`,
   );
 
   const top = MARGIN;
   const left0 = MARGIN;
 
-  await insertColumn({
-    headings: plan.left,
-    includeHeader: true,
-    fonts: plan.fonts,
-    left: left0,
-    blockW: plan.blockW,
-    top,
-    notePath,
-    layout,
-  });
-
-  if (plan.columns === 2 && plan.right.length > 0) {
-    const left1 = left0 + plan.blockW + GUTTER;
-    const maxLeft = pageSize.width - MARGIN - plan.blockW;
+  if (insertOnCurrentPage) {
     await insertColumn({
-      headings: plan.right,
-      includeHeader: false,
+      headings: plan.left,
+      includeHeader: true,
       fonts: plan.fonts,
-      left: Math.min(left1, Math.max(left0, maxLeft)),
+      left: left0,
       blockW: plan.blockW,
       top,
       notePath,
       layout,
     });
+
+    if (plan.columns === 2 && plan.right.length > 0) {
+      const left1 = left0 + plan.blockW + GUTTER;
+      const maxLeft = pageSize.width - MARGIN - plan.blockW;
+      await insertColumn({
+        headings: plan.right,
+        includeHeader: false,
+        fonts: plan.fonts,
+        left: Math.min(left1, Math.max(left0, maxLeft)),
+        blockW: plan.blockW,
+        top,
+        notePath,
+        layout,
+      });
+    }
+  } else {
+    const allElements = [];
+    await insertColumnViaFile({
+      headings: plan.left,
+      includeHeader: true,
+      fonts: plan.fonts,
+      left: left0,
+      blockW: plan.blockW,
+      top,
+      notePath,
+      layout,
+      tocPage: tocPg,
+      bucket: allElements,
+    });
+    if (plan.columns === 2 && plan.right.length > 0) {
+      const left1 = left0 + plan.blockW + GUTTER;
+      const maxLeft = pageSize.width - MARGIN - plan.blockW;
+      await insertColumnViaFile({
+        headings: plan.right,
+        includeHeader: false,
+        fonts: plan.fonts,
+        left: Math.min(left1, Math.max(left0, maxLeft)),
+        blockW: plan.blockW,
+        top,
+        notePath,
+        layout,
+        tocPage: tocPg,
+        bucket: allElements,
+      });
+    }
+    if (allElements.length > 0) {
+      const ins = await withTimeout(
+        PluginFileAPI.insertElements(notePath, tocPg, allElements),
+        30000,
+        'insertElements(toc)',
+      );
+      if (ins?.success === false) {
+        throw new Error(
+          `insertElements ToC failed: ${ins?.error?.message || 'unknown'}`,
+        );
+      }
+    }
   }
 
   try {
@@ -632,5 +801,6 @@ export async function insertTableOfContents({
     fontSize: plan.fonts.h1,
     inserted: plan.left.length + plan.right.length,
     layout,
+    tocPage: tocPg,
   };
 }
