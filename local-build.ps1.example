@@ -1,0 +1,4 @@
+# Optional local overrides for build-native.ps1
+# Copy to local-build.ps1 in the plugin root (gitignored) and edit:
+#   $env:JAVA_HOME = 'C:\Program Files\Microsoft\jdk-17.x.x'
+#   $env:ANDROID_HOME = "$env:LOCALAPPDATA\Android\Sdk"

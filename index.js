@@ -1,41 +1,25 @@
 /**
+ * IndexBot — Table of Contents from NOTE Titles
+ *
+ * Button 100 (toolbar, NOTE): Open style picker, generate ToC on current page
+ *
  * @format
  */
 
 import {AppRegistry, Image} from 'react-native';
 import App from './App';
 import {name as appName} from './app.json';
-
-import { PluginManager } from 'sn-plugin-lib';
+import {PluginManager} from 'sn-plugin-lib';
 
 AppRegistry.registerComponent(appName, () => App);
 
 PluginManager.init();
 
-PluginManager.registerButton(1, ['NOTE', 'DOC'], {
+const icon = Image.resolveAssetSource(require('./assets/icon.png')).uri;
+
+PluginManager.registerButton(1, ['NOTE'], {
   id: 100,
-  name: 'Side Button',
-  icon: Image.resolveAssetSource(
-    require('./assets/icon.png'),
-  ).uri,
-  showType: 1,
-});
-
-PluginManager.registerButton(2, ['NOTE', 'DOC'], {
-  id: 200,
-  name: 'Lasso Button',
-  icon: Image.resolveAssetSource(
-    require('./assets/icon.png'),
-  ).uri,
-  editDataTypes: [0, 1, 2, 3, 4],
-  showType: 1,
-});
-
-PluginManager.registerButton(3, ['NOTE', 'DOC'], {
-  id: 300,
-  name: 'Selection Button',
-  icon: Image.resolveAssetSource(
-    require('./assets/icon.png'),
-  ).uri,
+  name: 'IndexBot',
+  icon,
   showType: 1,
 });

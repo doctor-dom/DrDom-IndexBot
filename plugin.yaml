@@ -1,0 +1,9 @@
+﻿id: indexbot
+displayName: IndexBot
+slug: indexbot
+apps: [NOTE]
+pluginID: "indexbot001"
+pluginKey: IndexBot
+snplg: IndexBot.snplg
+native: true
+

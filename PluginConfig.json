@@ -1,0 +1,18 @@
+{
+  "name": "IndexBot",
+  "desc": "Build an editable Table of Contents from NOTE Titles with jump links",
+  "iconPath": "assets/icon.png",
+  "versionName": "0.2.0",
+  "versionCode": "2",
+  "pluginID": "indexbot001",
+  "pluginKey": "IndexBot",
+  "jsMainPath": "index",
+  "uses-permissions": [
+    "plugin.permission.FILE:READ",
+    "plugin.permission.FILE:WRITE"
+  ],
+  "nativeCodePackage": "/app.npk",
+  "reactPackages": [
+    "com.rnfs.RNFSPackage"
+  ]
+}

@@ -73,3 +73,9 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# Local overrides (never commit)
+config.local.js
+local-build.ps1
+*.snplg
+logs/
