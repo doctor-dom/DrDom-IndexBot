@@ -7,9 +7,11 @@ Supernote NOTE plugin that builds an editable **Table of Contents** from native 
 ### First run
 
 1. Mark headings with the **Title** tool (H1–H4 styles set hierarchy).
-2. Go to **page 1** — it must be **blank**.
+2. Open the note (any page is fine).
 3. Tap **IndexBot** in the note sidebar.
 4. Pick a layout, optionally enable **Snap-back links**, then **Generate ToC**.
+
+If page 1 already has handwriting, IndexBot inserts a new blank page 1 for the ToC (existing pages shift by one). The new page uses a system template that matches this device — not the raw name stored on the old first page.
 
 ### Refresh (update existing ToC)
 

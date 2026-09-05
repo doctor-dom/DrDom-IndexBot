@@ -34,6 +34,14 @@ function normalizeTitle(raw, fallbackPage) {
     ? t.controlTrailNums.map(n => Number(n)).filter(n => Number.isFinite(n))
     : [];
 
+  const inlineText =
+    t.text ??
+    t.fullText ??
+    t.showText ??
+    raw?.text ??
+    raw?.textBox?.textContentFull ??
+    '';
+
   return {
     page,
     y: Number(t.Y ?? t.y ?? 0),
@@ -45,7 +53,19 @@ function normalizeTitle(raw, fallbackPage) {
     controlTrailNums,
     num: Number(t.num ?? raw?.numInPage ?? 0),
     source: 'title',
+    ...(String(inlineText || '').trim()
+      ? {text: String(inlineText).trim()}
+      : {}),
   };
+}
+
+/** Shift heading page numbers after inserting a new front page. */
+export function shiftTitlePages(titles, delta) {
+  const d = Number(delta) || 0;
+  return (titles || []).map(t => ({
+    ...t,
+    page: toHostPageIndex(t.page) + d,
+  }));
 }
 
 function titleKey(item) {

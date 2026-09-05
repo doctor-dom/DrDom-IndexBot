@@ -1,5 +1,6 @@
 /**
- * Preflight: first-run requires page 1 blank; refresh allows any page.
+ * Preflight: first-run can start from any page (auto-inserts page 1 if needed).
+ * Refresh allows any page when a ToC already exists.
  */
 
 import {PluginCommAPI, PluginFileAPI} from 'sn-plugin-lib';
@@ -95,19 +96,12 @@ export async function checkInsertPage() {
     const isPage1 = currentPage === TOC_PAGE;
     const isBlank = isPageBlankAfterIndexBot(elements);
 
-    let message = '';
-    let ready = false;
-    if (!isPage1) {
-      message = `You are on page ${currentPage}. Go to page 1 first.`;
-    } else if (!isBlank) {
-      message = 'Page 1 has content. Clear it or use a blank page.';
-    } else {
-      message = 'Ready — page 1 is blank';
-      ready = true;
-    }
+    const message = isBlank
+      ? 'Ready — ToC will go on page 1'
+      : 'Ready — will insert a blank page 1 for the ToC';
 
     return {
-      ready,
+      ready: true,
       mode: 'initial',
       hasExistingToc: false,
       currentPage,
@@ -134,17 +128,6 @@ export async function checkInsertPage() {
 export function assertInsertPageReady(checkResult) {
   if (!checkResult?.notePath) {
     throw new Error('Could not get current note path. Open a NOTE file first.');
-  }
-  if (checkResult.mode === 'refresh') {
-    return checkResult;
-  }
-  if (!checkResult.isPage1) {
-    throw new Error(
-      `You are on page ${checkResult.currentPage}. Go to page 1 first.`,
-    );
-  }
-  if (!checkResult.isBlank) {
-    throw new Error('Page 1 has content. Clear it or use a blank page.');
   }
   return checkResult;
 }

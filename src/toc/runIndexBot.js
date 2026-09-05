@@ -3,11 +3,12 @@
  */
 
 import {PluginCommAPI, PluginFileAPI, PluginNoteAPI} from 'sn-plugin-lib';
-import {collectTitles} from './collectTitles';
+import {collectTitles, shiftTitlePages} from './collectTitles';
 import {ocrAllTitles, resolvePageSize} from './ocrTitle';
 import {insertTableOfContents} from './insertToc';
 import {normalizeLayout} from './layoutModes';
 import {checkInsertPage, assertInsertPageReady} from './checkInsertPage';
+import {insertFrontPage} from './insertFrontPage';
 import {syncSnapBackLinks} from './snapBackLinks';
 import {log, logError, startLogSession} from '../utils/debug';
 import {toHostPageIndex} from '../utils/pageIndex';
@@ -34,6 +35,10 @@ function withTimeout(promise, ms, label) {
       },
     );
   });
+}
+
+function fireAndForget(promise, label) {
+  promise.catch(e => log(TAG, `${label} failed: ${e.message}`));
 }
 
 /**
@@ -71,23 +76,17 @@ export async function runIndexBot(options = {}) {
   );
   const currentPage = toHostPageIndex(pn?.result ?? pn);
 
-  const totalRes = await withTimeout(
+  let totalRes = await withTimeout(
     PluginFileAPI.getNoteTotalPageNum(notePath),
     8000,
     'getNoteTotalPageNum',
   );
-  const pageCount = toHostPageIndex(
+  let pageCount = toHostPageIndex(
     totalRes?.result ?? totalRes ?? currentPage,
   );
 
-  const pageSize = await resolvePageSize(notePath, TOC_PAGE);
-  log(
-    TAG,
-    `path=${notePath} page=${currentPage} tocPage=${TOC_PAGE} mode=${runMode} pages=${pageCount} layout=${layout} snapBack=${snapBack}`,
-  );
-
   status('collect', 'Finding titles…');
-  const titles = await collectTitles(notePath, pageCount, currentPage);
+  let titles = await collectTitles(notePath, pageCount, currentPage);
   if (!titles.length) {
     throw new Error(
       'No Titles found. Mark headings with the Title tool, then try again.',
@@ -97,6 +96,22 @@ export async function runIndexBot(options = {}) {
     current: 0,
     total: titles.length,
   });
+
+  let insertedFrontPage = false;
+  if (runMode === 'initial' && !preflight.isBlank) {
+    status('insertPage', 'Inserting blank page 1…');
+    const inserted = await insertFrontPage(notePath);
+    pageCount = inserted.pageCount;
+    titles = shiftTitlePages(titles, 1);
+    insertedFrontPage = true;
+    log(TAG, `auto insertFront complete pages=${pageCount}`);
+  }
+
+  const pageSize = await resolvePageSize(notePath, TOC_PAGE);
+  log(
+    TAG,
+    `path=${notePath} page=${currentPage} tocPage=${TOC_PAGE} mode=${runMode} pages=${pageCount} layout=${layout} snapBack=${snapBack} insertedFront=${insertedFrontPage}`,
+  );
 
   status('ocr', `Recognizing 0/${titles.length}…`, {
     current: 0,
@@ -113,8 +128,10 @@ export async function runIndexBot(options = {}) {
         lastText: text,
       });
     },
+    currentPage,
   );
 
+  const forceFileInsert = insertedFrontPage || runMode === 'refresh';
   status('insert', 'Writing table of contents…');
   const result = await insertTableOfContents({
     notePath,
@@ -123,6 +140,7 @@ export async function runIndexBot(options = {}) {
     pageSize,
     headings: recognized,
     layout,
+    forceFileInsert,
   });
 
   if (!result.inserted) {
@@ -131,7 +149,10 @@ export async function runIndexBot(options = {}) {
     throw err;
   }
 
-  status('snapback', snapBack ? 'Adding snap-back links…' : 'Cleaning snap-back links…');
+  status(
+    'snapback',
+    snapBack ? 'Adding snap-back links…' : 'Cleaning snap-back links…',
+  );
   const snapResult = await syncSnapBackLinks({
     notePath,
     tocPage: TOC_PAGE,
@@ -141,10 +162,19 @@ export async function runIndexBot(options = {}) {
     enabled: snapBack,
   });
 
+  try {
+    await PluginCommAPI.reloadFile();
+  } catch (e) {
+    log(TAG, `reloadFile: ${e.message}`);
+  }
+
   let message = `Inserted ${result.inserted} heading${result.inserted === 1 ? '' : 's'}`;
   if (result.columns === 2) message += ' (2 columns)';
   if (result.omitted > 0) {
     message += `. ${result.omitted} omitted (page full)`;
+  }
+  if (insertedFrontPage) {
+    message += '. New page 1 added for ToC';
   }
   if (snapBack && snapResult.inserted > 0) {
     message += `. Snap-back on ${snapResult.inserted} page${snapResult.inserted === 1 ? '' : 's'}`;
@@ -162,6 +192,7 @@ export async function runIndexBot(options = {}) {
     layout,
     mode: runMode,
     snapBack,
+    insertedFrontPage,
     snapBackPages: snapResult.inserted,
     snapBackRemoved: snapResult.removed,
   };
@@ -185,15 +216,19 @@ export async function runIndexBotSafe(options = {}) {
       snapBack: options.snapBack,
       onStatus: wrapStatus,
     });
-    await clearErrorLog();
-    await writeLastRun({
-      layout: result.layout,
-      mode: result.mode,
-      snapBack: result.snapBack,
-      message: result.message,
-      inserted: result.inserted,
-      titleCount: result.titleCount,
-    });
+    fireAndForget(clearErrorLog(), 'clearErrorLog');
+    fireAndForget(
+      writeLastRun({
+        layout: result.layout,
+        mode: result.mode,
+        snapBack: result.snapBack,
+        insertedFrontPage: result.insertedFrontPage,
+        message: result.message,
+        inserted: result.inserted,
+        titleCount: result.titleCount,
+      }),
+      'writeLastRun',
+    );
     return {ok: true, ...result};
   } catch (err) {
     logError(TAG, err);

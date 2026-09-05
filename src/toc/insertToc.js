@@ -28,8 +28,13 @@ const TAG = 'Insert';
 const TYPE_TEXT = 500;
 const TYPE_LINK = 600;
 
-const MARGIN = 48;
 const GUTTER = 32;
+
+/** Page inset for TOC block (~5% width, min 80px). */
+export function tocMargin(pageSize) {
+  const w = pageSize?.width ?? 1404;
+  return Math.max(80, Math.round(w * 0.05));
+}
 const LINK_COL_W = 44;
 const LINE_FACTOR = 1.4;
 const CHAR_FACTOR = 0.55;
@@ -251,7 +256,7 @@ function applyLink(el, pageNum, notePath, destPage, rect, fontSize, fullText, sh
   return el;
 }
 
-function computeBlockWidth(headings, fonts, pageWidth, layout) {
+function computeBlockWidth(headings, fonts, pageWidth, layout, margin) {
   const minW = Math.floor(pageWidth * BLOCK_MIN_FRAC);
   const maxW = Math.floor(pageWidth * BLOCK_MAX_FRAC);
   const numbering = createNumberingState();
@@ -262,10 +267,10 @@ function computeBlockWidth(headings, fonts, pageWidth, layout) {
     const prefix = samplePrefixForWidth(h, layout, numbering);
     const title = cleanTitle(h.text);
     const level = displayLevel(h, layout);
-    const rowLeft = MARGIN + level * INDENT_PX;
+    const rowLeft = margin + level * INDENT_PX;
     const w =
       rowLeft -
-      MARGIN +
+      margin +
       estimateTextWidth(prefix + title, fs) +
       estimateTextWidth(' .... →', fs) +
       LINK_COL_W;
@@ -289,13 +294,14 @@ function measureColumnHeight(headings, fonts, layout, includeHeader) {
  */
 export function planLayout(headings, pageSize, layoutMode) {
   const layout = normalizeLayout(layoutMode);
-  const availableH = Math.max(0, pageSize.height - MARGIN * 2);
+  const margin = tocMargin(pageSize);
+  const availableH = Math.max(0, pageSize.height - margin * 2);
   const pageW = pageSize.width;
 
   const tryPlan = (fonts, columns) => {
     if (columns === 1) {
       const height = measureColumnHeight(headings, fonts, layout, true);
-      const blockW = computeBlockWidth(headings, fonts, pageW, layout);
+      const blockW = computeBlockWidth(headings, fonts, pageW, layout, margin);
       if (height <= availableH) {
         return {
           columns: 1,
@@ -328,7 +334,7 @@ export function planLayout(headings, pageSize, layoutMode) {
       };
     }
 
-    const halfW = Math.floor((pageW - MARGIN * 2 - GUTTER) / 2);
+    const halfW = Math.floor((pageW - margin * 2 - GUTTER) / 2);
     const colMax = Math.min(Math.floor(pageW * BLOCK_MAX_FRAC), halfW);
     const colMin = Math.min(Math.floor(pageW * BLOCK_MIN_FRAC), colMax);
 
@@ -358,6 +364,7 @@ export function planLayout(headings, pageSize, layoutMode) {
           fonts,
           pageW,
           layout,
+          margin,
         ),
       ),
     );
@@ -700,24 +707,26 @@ export async function insertTableOfContents({
   pageSize,
   headings,
   layout: layoutMode = 'compact',
+  forceFileInsert = false,
 }) {
   const layout = normalizeLayout(layoutMode);
   const tocPg = toHostPageIndex(tocPage);
   const curPg = toHostPageIndex(currentPage ?? tocPg);
-  const insertOnCurrentPage = curPg === tocPg;
+  const insertOnCurrentPage = !forceFileInsert && curPg === tocPg;
 
   await PluginNoteAPI.saveCurrentNote();
   await stripPreviousToc(notePath, tocPg);
   await PluginNoteAPI.saveCurrentNote();
 
   const plan = planLayout(headings, pageSize, layout);
+  const margin = tocMargin(pageSize);
   log(
     TAG,
-    `layout=${layout} tocPage=${tocPg} current=${curPg} fileInsert=${!insertOnCurrentPage} columns=${plan.columns} blockW=${plan.blockW}`,
+    `layout=${layout} tocPage=${tocPg} current=${curPg} fileInsert=${!insertOnCurrentPage} columns=${plan.columns} blockW=${plan.blockW} margin=${margin}`,
   );
 
-  const top = MARGIN;
-  const left0 = MARGIN;
+  const top = margin;
+  const left0 = margin;
 
   if (insertOnCurrentPage) {
     await insertColumn({
@@ -733,7 +742,7 @@ export async function insertTableOfContents({
 
     if (plan.columns === 2 && plan.right.length > 0) {
       const left1 = left0 + plan.blockW + GUTTER;
-      const maxLeft = pageSize.width - MARGIN - plan.blockW;
+      const maxLeft = pageSize.width - margin - plan.blockW;
       await insertColumn({
         headings: plan.right,
         includeHeader: false,
@@ -761,7 +770,7 @@ export async function insertTableOfContents({
     });
     if (plan.columns === 2 && plan.right.length > 0) {
       const left1 = left0 + plan.blockW + GUTTER;
-      const maxLeft = pageSize.width - MARGIN - plan.blockW;
+      const maxLeft = pageSize.width - margin - plan.blockW;
       await insertColumnViaFile({
         headings: plan.right,
         includeHeader: false,
