@@ -50,7 +50,7 @@ const LAYOUT_OPTIONS: {id: LayoutMode; label: string; hint: string}[] = [
 ];
 
 const WARNING_INITIAL =
-  'Place the Table of Contents on page 1 of your note. Go to a blank first page before generating.';
+  'IndexBot will put the ToC on page 1. If page 1 already has notes, a blank page is inserted first.';
 
 const WARNING_REFRESH =
   'An IndexBot ToC exists on page 1. Generate will re-scan the note and update it. You can run this from any page.';

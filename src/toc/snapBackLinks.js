@@ -3,6 +3,7 @@
  */
 
 import {PluginCommAPI, PluginFileAPI} from 'sn-plugin-lib';
+import {tocMargin} from './insertToc';
 import {log} from '../utils/debug';
 import {toHostPageIndex} from '../utils/pageIndex';
 import {
@@ -13,7 +14,6 @@ import {
 
 const TAG = 'SnapBack';
 const TYPE_LINK = 600;
-const MARGIN = 48;
 const LINK_FONT = 28;
 const LINK_W = 72;
 const LINK_H = 36;
@@ -53,10 +53,11 @@ function uniqueHeadingPages(headings, tocPage) {
 }
 
 function buildSnapBackElement(notePath, tocPage, page, pageSize) {
+  const margin = tocMargin(pageSize);
   const showW = Math.ceil(estimateTextWidth(SNAPBACK_SHOW, LINK_FONT)) + 8;
   const width = Math.max(LINK_W, showW);
-  const x = Math.max(MARGIN, pageSize.width - MARGIN - width);
-  const y = MARGIN;
+  const x = Math.max(margin, pageSize.width - margin - width);
+  const y = margin;
 
   return {
     type: TYPE_LINK,
