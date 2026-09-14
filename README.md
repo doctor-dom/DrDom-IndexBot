@@ -40,6 +40,8 @@ If page 1 is already blank, IndexBot uses it directly (no extra page is added).
 
 
 
+If page 1 already has handwriting, IndexBot inserts a new blank page 1 for the ToC (existing pages shift by one). The new page uses a system template that matches this device — not the raw name stored on the old first page.
+
 ### Refresh (update existing ToC)
 
 
