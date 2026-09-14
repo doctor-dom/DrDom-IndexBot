@@ -1,17 +1,22 @@
 /**
- * Tiered title collection: getTitles retry → targeted getElements → stickers.
- * Never scans every page in the notebook.
+ * Title collection: getTitles (file 0-based) + getElements scan, spatial dedupe.
  */
 
 import {PluginFileAPI} from 'sn-plugin-lib';
 import {log} from '../utils/debug';
-import {toHostPageIndex} from '../utils/pageIndex';
+import {
+  filePageIndices,
+  filePageToHost,
+  toHostPageIndex,
+} from '../utils/pageIndex';
+import {rectsOverlap} from './tocMarkers';
 
 const TAG = 'Collect';
 const TYPE_TITLE = 100;
 const TYPE_PICTURE = 200;
 const CHUNK_SIZE = 25;
 const CHUNK_DELAY_MS = 80;
+const DEDUPE_PAD = 32;
 
 /** Title style 1–4 → indent depth 0–3. */
 export function styleToIndent(style) {
@@ -22,17 +27,24 @@ export function styleToIndent(style) {
   return 0;
 }
 
-function normalizeTitle(raw, fallbackPage) {
+function normalizeTitleCore(raw, hostPage) {
   const t = raw?.title && typeof raw.title === 'object' ? raw.title : raw;
   if (!t || typeof t !== 'object') return null;
 
-  const page = toHostPageIndex(
-    t.page ?? raw?.pageNum ?? raw?.page ?? fallbackPage,
-  );
+  const page = toHostPageIndex(hostPage);
+
   const style = Number(t.style ?? 0);
   const controlTrailNums = Array.isArray(t.controlTrailNums)
     ? t.controlTrailNums.map(n => Number(n)).filter(n => Number.isFinite(n))
     : [];
+
+  const inlineText =
+    t.text ??
+    t.fullText ??
+    t.showText ??
+    raw?.text ??
+    raw?.textBox?.textContentFull ??
+    '';
 
   return {
     page,
@@ -45,7 +57,22 @@ function normalizeTitle(raw, fallbackPage) {
     controlTrailNums,
     num: Number(t.num ?? raw?.numInPage ?? 0),
     source: 'title',
+    ...(String(inlineText || '').trim()
+      ? {text: String(inlineText).trim()}
+      : {}),
   };
+}
+
+function normalizeTitleFromGetTitles(raw) {
+  const t = raw?.title && typeof raw.title === 'object' ? raw.title : raw;
+  const rawPage = t?.page ?? raw?.pageNum ?? raw?.page ?? 0;
+  const n = Number(rawPage);
+  const hostPage = Number.isFinite(n) && n >= 0 ? filePageToHost(n) : 1;
+  return normalizeTitleCore(raw, hostPage);
+}
+
+function normalizeTitleFromElements(raw, filePage) {
+  return normalizeTitleCore(raw, filePageToHost(filePage));
 }
 
 function titleKey(item) {
@@ -74,10 +101,47 @@ function sortTitles(list) {
   });
 }
 
-function pageListForCount(pageCount) {
-  const out = [];
-  for (let p = 1; p <= pageCount; p++) out.push(p);
-  return out;
+function titleRect(item) {
+  const x = Number(item.x) || 0;
+  const y = Number(item.y) || 0;
+  const w = Number(item.width) || 0;
+  const h = Number(item.height) || 0;
+  if (w <= 0 || h <= 0) {
+    return {left: x - 24, top: y - 24, right: x + 24, bottom: y + 24};
+  }
+  return {left: x, top: y, right: x + w, bottom: y + h};
+}
+
+function titlesOverlap(a, b) {
+  return rectsOverlap(titleRect(a), titleRect(b), DEDUPE_PAD);
+}
+
+function titleQuality(item) {
+  let score = 0;
+  if (item.controlTrailNums?.length) score += 10;
+  if (item.text) score += 5;
+  if (item.source === 'title') score += 2;
+  if (Number(item.num) > 0) score += 1;
+  return score;
+}
+
+function dedupeTitlesSpatial(list) {
+  const sorted = sortTitles(list);
+  const kept = [];
+  for (const item of sorted) {
+    const page = toHostPageIndex(item.page);
+    const dupIdx = kept.findIndex(
+      k => toHostPageIndex(k.page) === page && titlesOverlap(k, item),
+    );
+    if (dupIdx >= 0) {
+      if (titleQuality(item) > titleQuality(kept[dupIdx])) {
+        kept[dupIdx] = item;
+      }
+    } else {
+      kept.push(item);
+    }
+  }
+  return kept;
 }
 
 function chunkPages(pages, size) {
@@ -92,117 +156,108 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function getTitlesForPages(notePath, pages) {
-  if (!pages.length) return {items: [], ok: true, partial: false};
-  const res = await PluginFileAPI.getTitles(notePath, pages);
+function formatApiError(res) {
+  const err = res?.error;
+  if (!err) return '';
+  if (typeof err === 'string') return err;
+  const code = err.code ?? err.errorCode ?? '?';
+  const msg = err.message ?? err.msg ?? JSON.stringify(err);
+  return `code=${code} message=${msg}`;
+}
+
+function isTitleElement(el) {
+  return el?.type === TYPE_TITLE || (el?.title && typeof el.title === 'object');
+}
+
+function elementTypeHistogram(elements) {
+  const hist = {};
+  for (const el of elements || []) {
+    const t = el?.type ?? 'unknown';
+    hist[t] = (hist[t] || 0) + 1;
+  }
+  return hist;
+}
+
+async function getTitlesForPages(notePath, filePages, label) {
+  if (!filePages.length) return {items: [], ok: true, partial: false};
+  const res = await PluginFileAPI.getTitles(notePath, filePages);
   const ok = res?.success !== false;
   const items = [];
   if (Array.isArray(res?.result)) {
     for (const raw of res.result) {
-      const n = normalizeTitle(raw, pages[0] || 1);
+      const n = normalizeTitleFromGetTitles(raw);
       if (n) items.push(n);
     }
+  }
+  if (!ok) {
+    log(TAG, `getTitles ${label} failed: ${formatApiError(res)}`);
+  } else {
+    log(
+      TAG,
+      `getTitles ${label} filePages=[${filePages[0]}..${filePages[filePages.length - 1]}] count=${items.length}`,
+    );
   }
   return {items, ok, partial: !ok};
 }
 
-async function collectViaGetTitles(notePath, pageCount) {
-  const allPages = pageListForCount(pageCount);
-  const first = await getTitlesForPages(notePath, allPages);
-  log(
-    TAG,
-    `getTitles all pages success=${first.ok} count=${first.items.length}`,
-  );
-
-  if (first.ok && first.items.length > 0) {
-    return first.items;
-  }
-
-  if (first.ok && first.items.length === 0) {
-    return [];
-  }
-
-  // Retry in chunks when the full call failed
-  log(TAG, 'getTitles full call failed — retrying in chunks');
-  const chunks = chunkPages(allPages, CHUNK_SIZE);
+async function collectViaGetTitlesChunked(notePath, filePages, label) {
+  const chunks = chunkPages(filePages, CHUNK_SIZE);
   const chunkResults = [];
   let anyPartial = false;
 
   for (let i = 0; i < chunks.length; i++) {
     if (i > 0) await sleep(CHUNK_DELAY_MS);
-    const chunk = await getTitlesForPages(notePath, chunks[i]);
+    const chunk = await getTitlesForPages(
+      notePath,
+      chunks[i],
+      `${label} chunk ${i + 1}/${chunks.length}`,
+    );
     chunkResults.push(chunk.items);
     if (chunk.partial) anyPartial = true;
-    log(
-      TAG,
-      `getTitles chunk ${i + 1}/${chunks.length} ok=${chunk.ok} count=${chunk.items.length}`,
-    );
   }
 
-  const merged = mergeTitles(chunkResults);
-  if (merged.length > 0) {
-    return merged;
-  }
+  return {items: mergeTitles(chunkResults), anyPartial};
+}
 
-  if (!anyPartial && first.items.length > 0) {
+async function collectViaGetTitles(notePath, pageCount) {
+  const filePages = filePageIndices(pageCount);
+  if (!filePages.length) return [];
+
+  let first = await getTitlesForPages(notePath, filePages, 'file-index all');
+  if (first.ok && first.items.length > 0) {
     return first.items;
   }
 
-  return merged;
+  if (!first.ok) {
+    log(TAG, 'getTitles full call failed — retrying in chunks');
+    const chunked = await collectViaGetTitlesChunked(
+      notePath,
+      filePages,
+      'file-index',
+    );
+    if (chunked.items.length > 0) return chunked.items;
+  }
+
+  return first.items;
 }
 
-async function resolveCandidatePages(notePath, pageCount, currentPage, seedTitles) {
-  const pages = new Set();
-
-  for (const t of seedTitles) {
-    pages.add(toHostPageIndex(t.page));
-  }
-
-  if (pages.size === 0) {
-    try {
-      const stars = await PluginFileAPI.searchFiveStars(notePath);
-      const starPages = stars?.result ?? stars;
-      if (Array.isArray(starPages)) {
-        for (const p of starPages) pages.add(toHostPageIndex(p));
-      }
-    } catch (e) {
-      log(TAG, `searchFiveStars failed: ${e.message}`);
-    }
-
-    try {
-      const marks = await PluginFileAPI.getMarkPages(notePath);
-      const markPages = marks?.result ?? marks;
-      if (Array.isArray(markPages)) {
-        for (const p of markPages) pages.add(toHostPageIndex(p));
-      }
-    } catch (e) {
-      log(TAG, `getMarkPages failed: ${e.message}`);
-    }
-  }
-
-  if (pages.size === 0 && currentPage) {
-    pages.add(toHostPageIndex(currentPage));
-  }
-
-  return [...pages].filter(p => p >= 1 && p <= pageCount).sort((a, b) => a - b);
-}
-
-async function collectTitlesFromElements(notePath, pages) {
+async function collectTitlesFromElements(notePath, filePages) {
   const out = [];
-  for (const page of pages) {
-    const hostPage = toHostPageIndex(page);
-    const res = await PluginFileAPI.getElements(hostPage, notePath);
+  for (const filePage of filePages) {
+    const res = await PluginFileAPI.getElements(filePage, notePath);
     if (!res?.success || !Array.isArray(res.result)) {
-      log(TAG, `getElements page=${hostPage} failed: ${JSON.stringify(res?.error)}`);
+      log(TAG, `getElements file=${filePage} failed: ${formatApiError(res)}`);
       continue;
     }
+    const hist = elementTypeHistogram(res.result);
+    log(TAG, `getElements file=${filePage} types=${JSON.stringify(hist)}`);
     for (const el of res.result) {
-      if (el?.type !== TYPE_TITLE) continue;
-      const n = normalizeTitle(el, hostPage);
+      if (!isTitleElement(el)) continue;
+      const n = normalizeTitleFromElements(el, filePage);
       if (n) out.push(n);
     }
   }
-  log(TAG, `getElements titles on ${pages.length} pages → ${out.length}`);
+  log(TAG, `getElements titles on ${filePages.length} file pages → ${out.length}`);
   return out;
 }
 
@@ -211,14 +266,14 @@ function stickerBasename(path) {
   return base.replace(/\.sticker$/i, '').replace(/[_-]+/g, ' ').trim() || 'Sticker';
 }
 
-function normalizeSticker(el, page) {
+function normalizeSticker(el, hostPage) {
   const pic = el?.picture;
   const path = pic?.picturePath || '';
   if (!path.toLowerCase().endsWith('.sticker')) return null;
 
   const rect = pic?.rect || {};
   return {
-    page: toHostPageIndex(page),
+    page: toHostPageIndex(hostPage),
     y: Number(rect.top ?? 0),
     x: Number(rect.left ?? 0),
     width: Number((rect.right ?? 0) - (rect.left ?? 0)),
@@ -232,11 +287,11 @@ function normalizeSticker(el, page) {
   };
 }
 
-async function collectStickersFromElements(notePath, pages) {
+async function collectStickersFromElements(notePath, filePages) {
   const out = [];
-  for (const page of pages) {
-    const hostPage = toHostPageIndex(page);
-    const res = await PluginFileAPI.getElements(hostPage, notePath);
+  for (const filePage of filePages) {
+    const hostPage = filePageToHost(filePage);
+    const res = await PluginFileAPI.getElements(filePage, notePath);
     if (!res?.success || !Array.isArray(res.result)) continue;
     for (const el of res.result) {
       if (el?.type !== TYPE_PICTURE) continue;
@@ -244,38 +299,59 @@ async function collectStickersFromElements(notePath, pages) {
       if (n) out.push(n);
     }
   }
-  log(TAG, `stickers on ${pages.length} pages → ${out.length}`);
+  log(TAG, `stickers on ${filePages.length} file pages → ${out.length}`);
   return out;
 }
 
 /**
- * @returns {Promise<Array<{page,y,x,width,height,style,indentLevel,controlTrailNums,num,text?,source}>>}
+ * @param {number} pageCount host total page count
+ * @param {{ tocHostPage?: number, excludeTocHostPage?: boolean }} [options]
  */
-export async function collectTitles(notePath, pageCount, currentPage = 1) {
-  let list = await collectViaGetTitles(notePath, pageCount);
+export async function collectTitles(notePath, pageCount, options = {}) {
+  const tocHostPage = toHostPageIndex(options.tocHostPage ?? 1);
+  const excludeTocHostPage = Boolean(options.excludeTocHostPage);
+  const filePages = filePageIndices(pageCount);
 
-  const needsFallback = !list || list.length === 0;
-  if (needsFallback) {
-    const candidatePages = await resolveCandidatePages(
-      notePath,
-      pageCount,
-      currentPage,
-      list || [],
-    );
-    log(TAG, `candidate pages for fallback: ${candidatePages.join(',') || '(none)'}`);
+  const fromGetTitles = await collectViaGetTitles(notePath, pageCount);
+  const getTitlesCount = (fromGetTitles || []).length;
 
-    if (candidatePages.length > 0) {
-      const fromElements = await collectTitlesFromElements(notePath, candidatePages);
-      list = mergeTitles([list || [], fromElements]);
+  const fromElements = await collectTitlesFromElements(notePath, filePages);
+  let list = mergeTitles([fromGetTitles || [], fromElements]);
+  const mergedCount = list.length;
 
-      if (!list.length) {
-        const stickers = await collectStickersFromElements(notePath, candidatePages);
-        list = mergeTitles([list, stickers]);
-      }
+  list = dedupeTitlesSpatial(list);
+  if (excludeTocHostPage) {
+    list = list.filter(t => toHostPageIndex(t.page) !== tocHostPage);
+  }
+  const uniqueCount = list.length;
+
+  log(
+    TAG,
+    `getTitles=${getTitlesCount} getElements=${fromElements.length} merged=${mergedCount} unique=${uniqueCount} excludeToc=${excludeTocHostPage}`,
+  );
+
+  if (!list.length) {
+    const stickers = await collectStickersFromElements(notePath, filePages);
+    list = mergeTitles([list, stickers]);
+    if (excludeTocHostPage) {
+      list = list.filter(t => toHostPageIndex(t.page) !== tocHostPage);
+    }
+    if (stickers.length > 0) {
+      log(TAG, `stickers merged total=${list.length}`);
     }
   }
 
   const sorted = sortTitles(list || []);
   log(TAG, `sorted ${sorted.length} titles`);
   return sorted;
+}
+
+/** Shift every heading host page after inserting a page at the front. */
+export function shiftTitlePages(titles, delta = 1) {
+  const d = Number(delta) || 0;
+  if (d === 0) return titles;
+  return titles.map(t => ({
+    ...t,
+    page: toHostPageIndex(t.page) + d,
+  }));
 }

@@ -7,13 +7,17 @@
 
 import {PluginCommAPI, PluginFileAPI, PluginNoteAPI} from 'sn-plugin-lib';
 import {log} from '../utils/debug';
-import {toHostPageIndex} from '../utils/pageIndex';
+import {toFilePageIndex, toHostPageIndex} from '../utils/pageIndex';
 import {normalizeLayout} from './layoutModes';
 import {
   isIndexBotTocLink,
   LINK_SENTINEL,
   JUMP_SHOW,
   TOC_HEADER,
+  INDEXBOT_USERDATA_TOC_HEADER,
+  INDEXBOT_USERDATA_TOC_ROW,
+  INDEXBOT_USERDATA_TOC_LINK,
+  isIndexBotTocUserData,
   textBoxFirstLine,
   textBoxRect,
   linkRect,
@@ -28,24 +32,41 @@ const TAG = 'Insert';
 const TYPE_TEXT = 500;
 const TYPE_LINK = 600;
 
-const MARGIN = 48;
 const GUTTER = 32;
+
+/** Page inset for TOC block (~5% width, min 80px). */
+export function tocMargin(pageSize) {
+  const w = pageSize?.width ?? 1404;
+  return Math.max(80, Math.round(w * 0.05));
+}
+
+/** Horizontally center the ToC block (one or two columns) on the page. */
+export function tocBlockOrigin(pageSize, blockW, columns = 1) {
+  const pageW = pageSize?.width ?? 1404;
+  const cols = Math.max(1, Number(columns) || 1);
+  const totalW = blockW * cols + (cols > 1 ? GUTTER : 0);
+  const minLeft = tocMargin(pageSize);
+  const centered = Math.round((pageW - totalW) / 2);
+  return Math.max(minLeft, centered);
+}
 const LINK_COL_W = 44;
-const LINE_FACTOR = 1.4;
+const LINE_FACTOR = 1.2;
 const CHAR_FACTOR = 0.55;
 const BLOCK_MIN_FRAC = 0.4;
-const BLOCK_MAX_FRAC = 0.55;
+const BLOCK_MAX_FRAC = 0.88;
 const FONT_SCALE_SHRINK = 0.75;
-const INDENT_PX = 24;
+const INDENT_PX = 16;
+const MIN_DOTS = 2;
+const MAX_DOTS = 12;
 
 const OUTLINE_BULLETS = ['', '• ', '◦ ', '- '];
 
 const FONTS_BASE = {
-  header: 52,
-  h1: 48,
-  h2: 42,
-  h3: 36,
-  h4: 32,
+  header: 36,
+  h1: 28,
+  h2: 26,
+  h3: 24,
+  h4: 22,
 };
 
 function withTimeout(promise, ms, label) {
@@ -153,24 +174,26 @@ function rowLeftOffset(baseLeft, heading, layout) {
   return baseLeft + level * INDENT_PX;
 }
 
-function buildRowParts(heading, fonts, layout, numbering, leaderAreaWidth) {
+function buildRowParts(heading, fonts, layout, numbering, rowLeft, linkRight) {
   const fs = fontForHeading(heading, fonts, layout);
   const level = displayLevel(heading, layout);
   const prefix = buildTitlePrefix(heading, layout, numbering);
   const prefixW = estimateTextWidth(prefix, fs);
 
-  const titleBudget = Math.max(
-    fs * 3,
-    leaderAreaWidth - prefixW - estimateTextWidth(' … →', fs),
+  const leaderReserve = Math.max(
+    estimateTextWidth(`${'.'.repeat(MAX_DOTS)} ${JUMP_SHOW}`, fs),
+    LINK_COL_W,
   );
-  const title = truncateToWidth(heading.text, fs, titleBudget);
+  const linkLeft = Math.max(rowLeft + fs * 2, linkRight - leaderReserve);
+  const titleMaxW = Math.max(fs * 2, linkLeft - rowLeft - 4 - prefixW);
+  const title = truncateToWidth(heading.text, fs, titleMaxW);
   const titleText = `${prefix}${title}`;
   const titleW = estimateTextWidth(titleText, fs);
 
-  const leaderBudget = Math.max(fs * 2, leaderAreaWidth - titleW);
+  const leaderBudget = Math.max(fs, linkRight - rowLeft - titleW);
   const dotW = estimateTextWidth('.', fs) || fs * CHAR_FACTOR;
   let dots = Math.floor(leaderBudget / dotW);
-  if (dots < 3) dots = 3;
+  dots = Math.max(MIN_DOTS, Math.min(MAX_DOTS, dots));
   const leaderText = `${'.'.repeat(dots)} ${JUMP_SHOW}`;
 
   const textBold = layout === 'outline' && level === 0 ? 1 : 0;
@@ -181,7 +204,8 @@ function buildRowParts(heading, fonts, layout, numbering, leaderAreaWidth) {
     fontSize: fs,
     height: lineHeight(fs),
     textBold,
-    titleW,
+    titleRight: linkLeft - 4,
+    linkLeft,
   };
 }
 
@@ -203,9 +227,10 @@ async function createSdkElement(type) {
   return res.result;
 }
 
-function applyTextBox(el, pageNum, text, rect, fontSize, textBold) {
+function applyTextBox(el, filePage, text, rect, fontSize, textBold, userDataTag) {
+  const fp = Math.max(0, Math.floor(Number(filePage) || 0));
   el.type = TYPE_TEXT;
-  el.pageNum = toHostPageIndex(pageNum);
+  el.pageNum = fp;
   el.layerNum = 0;
   el.textBox = {
     fontSize,
@@ -223,26 +248,46 @@ function applyTextBox(el, pageNum, text, rect, fontSize, textBold) {
     textFrameStyle: 0,
     textEditable: 0,
   };
+  if (userDataTag) {
+    el.userData = userDataTag;
+  }
   return el;
 }
 
-function applyLink(el, pageNum, notePath, destPage, rect, fontSize, fullText, showText) {
+function applyLink(
+  el,
+  filePage,
+  notePath,
+  destHostPage,
+  rect,
+  fontSize,
+  fullText,
+  showText,
+  userDataTag = INDEXBOT_USERDATA_TOC_LINK,
+) {
+  const fp = Math.max(0, Math.floor(Number(filePage) || 0));
   el.type = TYPE_LINK;
-  el.pageNum = toHostPageIndex(pageNum);
+  el.pageNum = fp;
   el.layerNum = 0;
+  if (userDataTag) {
+    el.userData = userDataTag;
+  }
   const w = Math.round(rect.right - rect.left);
   const h = Math.round(rect.bottom - rect.top);
+  if (w <= 0 || h <= 0) {
+    throw new Error('ToC link rect has zero area');
+  }
   el.link = {
     category: 0,
     X: Math.round(rect.left),
     Y: Math.round(rect.top),
     width: w,
     height: h,
-    page: toHostPageIndex(pageNum),
+    page: fp,
     style: 0,
     linkType: 0,
     destPath: notePath,
-    destPage: toHostPageIndex(destPage),
+    destPage: toHostPageIndex(destHostPage),
     fontSize,
     fullText,
     showText,
@@ -251,9 +296,22 @@ function applyLink(el, pageNum, notePath, destPage, rect, fontSize, fullText, sh
   return el;
 }
 
-function computeBlockWidth(headings, fonts, pageWidth, layout) {
+function assertRowGeometry(rowLeft, linkRight, row, headingLabel) {
+  if (!String(row?.titleText || '').trim()) {
+    throw new Error(`Empty ToC row for "${headingLabel || 'heading'}"`);
+  }
+  if (row.titleRight <= rowLeft) {
+    throw new Error(`Invalid title box for "${headingLabel || 'heading'}"`);
+  }
+  if (row.linkLeft >= linkRight || row.linkLeft < rowLeft) {
+    throw new Error(`Invalid link box for "${headingLabel || 'heading'}"`);
+  }
+}
+
+function computeBlockWidth(headings, fonts, pageWidth, layout, margin) {
+  const fullW = pageWidth - margin * 2;
   const minW = Math.floor(pageWidth * BLOCK_MIN_FRAC);
-  const maxW = Math.floor(pageWidth * BLOCK_MAX_FRAC);
+  const maxW = Math.min(fullW, Math.floor(pageWidth * BLOCK_MAX_FRAC));
   const numbering = createNumberingState();
   let contentW = estimateTextWidth(TOC_HEADER, fonts.header);
 
@@ -262,10 +320,10 @@ function computeBlockWidth(headings, fonts, pageWidth, layout) {
     const prefix = samplePrefixForWidth(h, layout, numbering);
     const title = cleanTitle(h.text);
     const level = displayLevel(h, layout);
-    const rowLeft = MARGIN + level * INDENT_PX;
+    const rowLeft = margin + level * INDENT_PX;
     const w =
       rowLeft -
-      MARGIN +
+      margin +
       estimateTextWidth(prefix + title, fs) +
       estimateTextWidth(' .... →', fs) +
       LINK_COL_W;
@@ -289,13 +347,14 @@ function measureColumnHeight(headings, fonts, layout, includeHeader) {
  */
 export function planLayout(headings, pageSize, layoutMode) {
   const layout = normalizeLayout(layoutMode);
-  const availableH = Math.max(0, pageSize.height - MARGIN * 2);
+  const margin = tocMargin(pageSize);
+  const availableH = Math.max(0, pageSize.height - margin * 2);
   const pageW = pageSize.width;
 
   const tryPlan = (fonts, columns) => {
     if (columns === 1) {
       const height = measureColumnHeight(headings, fonts, layout, true);
-      const blockW = computeBlockWidth(headings, fonts, pageW, layout);
+      const blockW = computeBlockWidth(headings, fonts, pageW, layout, margin);
       if (height <= availableH) {
         return {
           columns: 1,
@@ -328,7 +387,7 @@ export function planLayout(headings, pageSize, layoutMode) {
       };
     }
 
-    const halfW = Math.floor((pageW - MARGIN * 2 - GUTTER) / 2);
+    const halfW = Math.floor((pageW - margin * 2 - GUTTER) / 2);
     const colMax = Math.min(Math.floor(pageW * BLOCK_MAX_FRAC), halfW);
     const colMin = Math.min(Math.floor(pageW * BLOCK_MIN_FRAC), colMax);
 
@@ -358,6 +417,7 @@ export function planLayout(headings, pageSize, layoutMode) {
           fonts,
           pageW,
           layout,
+          margin,
         ),
       ),
     );
@@ -385,12 +445,60 @@ export function planLayout(headings, pageSize, layoutMode) {
   return plan;
 }
 
-async function stripPreviousToc(notePath, pageNum) {
-  const page = toHostPageIndex(pageNum);
+async function verifyTocOnPage(notePath, filePage, expectedLinks) {
   const res = await withTimeout(
-    PluginFileAPI.getElements(page, notePath),
+    PluginFileAPI.getElements(filePage, notePath),
     15000,
-    'getElements(strip)',
+    `getElements(verify file=${filePage})`,
+  );
+  if (!res?.success || !Array.isArray(res.result)) {
+    throw new Error(
+      `ToC verify failed: could not read page file=${filePage}`,
+    );
+  }
+
+  let tocLinks = 0;
+  let hasHeader = false;
+  let headingTexts = 0;
+
+  for (const el of res.result) {
+    if (isIndexBotTocLink(el)) {
+      tocLinks += 1;
+      continue;
+    }
+    if (el?.type === TYPE_TEXT) {
+      const first = textBoxFirstLine(el).trim();
+      if (first === TOC_HEADER) {
+        hasHeader = true;
+      } else if (first && !first.includes('indexbot-toc')) {
+        headingTexts += 1;
+      }
+    }
+  }
+
+  log(
+    TAG,
+    `verify file=${filePage} links=${tocLinks} headingTexts=${headingTexts} header=${hasHeader} expected=${expectedLinks}`,
+  );
+
+  if (expectedLinks > 0 && tocLinks === 0) {
+    throw new Error(
+      `ToC verify failed: 0 jump links on page (expected ${expectedLinks})`,
+    );
+  }
+  if (expectedLinks > 0 && !hasHeader) {
+    throw new Error('ToC verify failed: header missing after insert');
+  }
+
+  return {tocLinks, hasHeader, headingTexts};
+}
+
+async function stripPreviousToc(notePath, tocHostPage) {
+  const filePage = toFilePageIndex(tocHostPage);
+  const res = await withTimeout(
+    PluginFileAPI.getElements(filePage, notePath),
+    15000,
+    `getElements(strip file=${filePage})`,
   );
   if (!res?.success || !Array.isArray(res.result)) {
     log(TAG, `strip getElements failed: ${JSON.stringify(res?.error)}`);
@@ -414,6 +522,10 @@ async function stripPreviousToc(notePath, pageNum) {
       continue;
     }
     if (el?.type === TYPE_TEXT) {
+      if (isIndexBotTocUserData(el.userData)) {
+        removed += 1;
+        continue;
+      }
       const first = textBoxFirstLine(el).trim();
       if (first === TOC_HEADER) {
         removed += 1;
@@ -440,151 +552,15 @@ async function stripPreviousToc(notePath, pageNum) {
 
   log(TAG, `Removing ${removed} IndexBot ToC elements, keeping ${kept.length}`);
   const replace = await withTimeout(
-    PluginFileAPI.replaceElements(notePath, page, kept),
+    PluginFileAPI.replaceElements(notePath, filePage, kept),
     20000,
-    'replaceElements',
+    `replaceElements(file=${filePage})`,
   );
   log(TAG, `replaceElements success=${replace?.success}`);
   if (!replace?.success) {
     throw new Error(
       `Failed to clear previous ToC: ${replace?.error?.message || 'unknown'}`,
     );
-  }
-}
-
-async function insertHeaderRow({left, top, textRight, fonts}) {
-  const fs = fonts.header;
-  const h = lineHeight(fs);
-  const textRes = await PluginNoteAPI.insertText({
-    textContentFull: TOC_HEADER,
-    textRect: {
-      left,
-      top,
-      right: textRight,
-      bottom: top + h,
-    },
-    fontSize: fs,
-    textAlign: 0,
-    textBold: 1,
-    textItalics: 0,
-    textFrameWidthType: 0,
-    textFrameStyle: 0,
-    textEditable: 0,
-  });
-  if (textRes && textRes.success === false) {
-    throw new Error(
-      `insertText header failed: ${textRes?.error?.message || 'unknown'}`,
-    );
-  }
-  return h;
-}
-
-async function insertHeadingRow({
-  heading,
-  fonts,
-  baseLeft,
-  top,
-  blockW,
-  notePath,
-  layout,
-  numbering,
-}) {
-  const rowLeft = rowLeftOffset(baseLeft, heading, layout);
-  const linkRight = baseLeft + blockW;
-  const leaderAreaWidth = Math.max(8, linkRight - rowLeft);
-
-  const row = buildRowParts(
-    heading,
-    fonts,
-    layout,
-    numbering,
-    leaderAreaWidth,
-  );
-
-  const titleRight = Math.min(
-    linkRight - LINK_COL_W - 4,
-    rowLeft + Math.ceil(row.titleW) + 8,
-  );
-  const linkLeft = Math.max(titleRight, rowLeft + Math.ceil(row.titleW));
-
-  const textRes = await PluginNoteAPI.insertText({
-    textContentFull: row.titleText,
-    textRect: {
-      left: rowLeft,
-      top,
-      right: titleRight,
-      bottom: top + row.height,
-    },
-    fontSize: row.fontSize,
-    textAlign: 0,
-    textBold: row.textBold,
-    textItalics: 0,
-    textFrameWidthType: 0,
-    textFrameStyle: 0,
-    textEditable: 0,
-  });
-  if (textRes && textRes.success === false) {
-    log(
-      TAG,
-      `insertText failed for "${heading.text}": ${JSON.stringify(textRes.error)}`,
-    );
-  }
-
-  const linkRes = await PluginNoteAPI.insertTextLink({
-    destPath: notePath,
-    destPage: toHostPageIndex(heading.page),
-    style: 0,
-    linkType: 0,
-    rect: {
-      left: linkLeft,
-      top,
-      right: linkRight,
-      bottom: top + row.height,
-    },
-    fontSize: row.fontSize,
-    fullText: `${row.leaderText}${LINK_SENTINEL}`,
-    showText: row.leaderText,
-    isItalic: 0,
-  });
-  if (linkRes && linkRes.success === false) {
-    log(
-      TAG,
-      `insertTextLink failed for "${heading.text}": ${JSON.stringify(linkRes.error)}`,
-    );
-  }
-  return row.height;
-}
-
-async function insertColumn({
-  headings,
-  includeHeader,
-  fonts,
-  left,
-  blockW,
-  top,
-  notePath,
-  layout,
-}) {
-  const linkRight = left + blockW;
-  const textRight = linkRight - LINK_COL_W - 6;
-  let y = top;
-  const numbering = createNumberingState();
-
-  if (includeHeader) {
-    y += await insertHeaderRow({left, top: y, textRight, fonts});
-  }
-
-  for (const heading of headings) {
-    y += await insertHeadingRow({
-      heading,
-      fonts,
-      baseLeft: left,
-      top: y,
-      blockW,
-      notePath,
-      layout,
-      numbering,
-    });
   }
 }
 
@@ -597,7 +573,10 @@ async function buildColumnElements({
   top,
   notePath,
   layout,
-  tocPage,
+  tocFilePage,
+  onProgress,
+  rowOffset = 0,
+  rowTotal = 0,
 }) {
   const linkRight = left + blockW;
   const textRight = linkRight - LINK_COL_W - 6;
@@ -610,49 +589,51 @@ async function buildColumnElements({
     const h = lineHeight(fs);
     const textEl = applyTextBox(
       await createSdkElement(TYPE_TEXT),
-      tocPage,
+      tocFilePage,
       TOC_HEADER,
       {left, top: y, right: textRight, bottom: y + h},
       fs,
       true,
+      INDEXBOT_USERDATA_TOC_HEADER,
     );
     elements.push(textEl);
     y += h;
   }
 
-  for (const heading of headings) {
+  for (let i = 0; i < headings.length; i++) {
+    const heading = headings[i];
+    if (typeof onProgress === 'function' && rowTotal > 0) {
+      onProgress(rowOffset + i + 1, rowTotal);
+    }
     const rowLeft = rowLeftOffset(left, heading, layout);
-    const leaderAreaWidth = Math.max(8, linkRight - rowLeft);
     const row = buildRowParts(
       heading,
       fonts,
       layout,
       numbering,
-      leaderAreaWidth,
+      rowLeft,
+      linkRight,
     );
-    const titleRight = Math.min(
-      linkRight - LINK_COL_W - 4,
-      rowLeft + Math.ceil(row.titleW) + 8,
-    );
-    const linkLeft = Math.max(titleRight, rowLeft + Math.ceil(row.titleW));
+    assertRowGeometry(rowLeft, linkRight, row, heading.text);
 
     elements.push(
       applyTextBox(
         await createSdkElement(TYPE_TEXT),
-        tocPage,
+        tocFilePage,
         row.titleText,
-        {left: rowLeft, top: y, right: titleRight, bottom: y + row.height},
+        {left: rowLeft, top: y, right: row.titleRight, bottom: y + row.height},
         row.fontSize,
         row.textBold === 1,
+        INDEXBOT_USERDATA_TOC_ROW,
       ),
     );
     elements.push(
       applyLink(
         await createSdkElement(TYPE_LINK),
-        tocPage,
+        tocFilePage,
         notePath,
         heading.page,
-        {left: linkLeft, top: y, right: linkRight, bottom: y + row.height},
+        {left: row.linkLeft, top: y, right: linkRight, bottom: y + row.height},
         row.fontSize,
         `${row.leaderText}${LINK_SENTINEL}`,
         row.leaderText,
@@ -673,8 +654,11 @@ async function insertColumnViaFile({
   top,
   notePath,
   layout,
-  tocPage,
+  tocFilePage,
   bucket,
+  onProgress,
+  rowOffset = 0,
+  rowTotal = 0,
 }) {
   const els = await buildColumnElements({
     headings,
@@ -685,122 +669,111 @@ async function insertColumnViaFile({
     top,
     notePath,
     layout,
-    tocPage,
+    tocFilePage,
+    onProgress,
+    rowOffset,
+    rowTotal,
   });
   bucket.push(...els);
 }
 
 /**
  * Strip old ToC and insert new layout on tocPage (default page 1).
+ * Always writes through File API so rows persist before reloadFile.
  */
 export async function insertTableOfContents({
   notePath,
   tocPage = 1,
-  currentPage,
   pageSize,
   headings,
   layout: layoutMode = 'compact',
+  onProgress,
 }) {
   const layout = normalizeLayout(layoutMode);
-  const tocPg = toHostPageIndex(tocPage);
-  const curPg = toHostPageIndex(currentPage ?? tocPg);
-  const insertOnCurrentPage = curPg === tocPg;
+  const tocHostPg = toHostPageIndex(tocPage);
+  const tocFilePage = toFilePageIndex(tocHostPg);
 
   await PluginNoteAPI.saveCurrentNote();
-  await stripPreviousToc(notePath, tocPg);
+  await stripPreviousToc(notePath, tocHostPg);
   await PluginNoteAPI.saveCurrentNote();
 
   const plan = planLayout(headings, pageSize, layout);
+  const expectedLinks = plan.left.length + plan.right.length;
   log(
     TAG,
-    `layout=${layout} tocPage=${tocPg} current=${curPg} fileInsert=${!insertOnCurrentPage} columns=${plan.columns} blockW=${plan.blockW}`,
+    `layout=${layout} tocHost=${tocHostPg} tocFile=${tocFilePage} fileInsert=1 columns=${plan.columns} blockW=${plan.blockW} singleLineRows=1`,
   );
 
-  const top = MARGIN;
-  const left0 = MARGIN;
+  if (expectedLinks === 0) {
+    throw new Error('No headings to insert into ToC');
+  }
 
-  if (insertOnCurrentPage) {
-    await insertColumn({
-      headings: plan.left,
-      includeHeader: true,
-      fonts: plan.fonts,
-      left: left0,
-      blockW: plan.blockW,
-      top,
-      notePath,
-      layout,
-    });
+  const margin = tocMargin(pageSize);
+  const top = margin;
+  const left0 = tocBlockOrigin(pageSize, plan.blockW, plan.columns);
+  log(TAG, `tocCenter left=${left0} blockW=${plan.blockW} columns=${plan.columns}`);
 
-    if (plan.columns === 2 && plan.right.length > 0) {
-      const left1 = left0 + plan.blockW + GUTTER;
-      const maxLeft = pageSize.width - MARGIN - plan.blockW;
-      await insertColumn({
-        headings: plan.right,
-        includeHeader: false,
-        fonts: plan.fonts,
-        left: Math.min(left1, Math.max(left0, maxLeft)),
-        blockW: plan.blockW,
-        top,
-        notePath,
-        layout,
-      });
-    }
-  } else {
-    const allElements = [];
+  const allElements = [];
+  await insertColumnViaFile({
+    headings: plan.left,
+    includeHeader: true,
+    fonts: plan.fonts,
+    left: left0,
+    blockW: plan.blockW,
+    top,
+    notePath,
+    layout,
+    tocFilePage,
+    bucket: allElements,
+    onProgress,
+    rowOffset: 0,
+    rowTotal: expectedLinks,
+  });
+  if (plan.columns === 2 && plan.right.length > 0) {
+    const left1 = left0 + plan.blockW + GUTTER;
     await insertColumnViaFile({
-      headings: plan.left,
-      includeHeader: true,
+      headings: plan.right,
+      includeHeader: false,
       fonts: plan.fonts,
-      left: left0,
+      left: left1,
       blockW: plan.blockW,
       top,
       notePath,
       layout,
-      tocPage: tocPg,
+      tocFilePage,
       bucket: allElements,
+      onProgress,
+      rowOffset: plan.left.length,
+      rowTotal: expectedLinks,
     });
-    if (plan.columns === 2 && plan.right.length > 0) {
-      const left1 = left0 + plan.blockW + GUTTER;
-      const maxLeft = pageSize.width - MARGIN - plan.blockW;
-      await insertColumnViaFile({
-        headings: plan.right,
-        includeHeader: false,
-        fonts: plan.fonts,
-        left: Math.min(left1, Math.max(left0, maxLeft)),
-        blockW: plan.blockW,
-        top,
-        notePath,
-        layout,
-        tocPage: tocPg,
-        bucket: allElements,
-      });
-    }
-    if (allElements.length > 0) {
-      const ins = await withTimeout(
-        PluginFileAPI.insertElements(notePath, tocPg, allElements),
-        30000,
-        'insertElements(toc)',
-      );
-      if (ins?.success === false) {
-        throw new Error(
-          `insertElements ToC failed: ${ins?.error?.message || 'unknown'}`,
-        );
-      }
-    }
   }
 
-  try {
-    await PluginCommAPI.reloadFile();
-  } catch (e) {
-    log(TAG, `reloadFile: ${e.message}`);
+  if (allElements.length === 0) {
+    throw new Error('No ToC elements built for insert');
   }
+
+  const ins = await withTimeout(
+    PluginFileAPI.insertElements(notePath, tocFilePage, allElements),
+    30000,
+    `insertElements(toc file=${tocFilePage})`,
+  );
+  if (ins?.success !== true) {
+    throw new Error(
+      `insertElements ToC failed: ${ins?.error?.message || 'unknown'}`,
+    );
+  }
+
+  await PluginNoteAPI.saveCurrentNote();
+
+  const verified = await verifyTocOnPage(notePath, tocFilePage, expectedLinks);
 
   return {
     omitted: plan.omitted,
     columns: plan.columns,
     fontSize: plan.fonts.h1,
-    inserted: plan.left.length + plan.right.length,
+    inserted: verified.tocLinks,
+    tocLinks: verified.tocLinks,
     layout,
-    tocPage: tocPg,
+    tocPage: tocHostPg,
   };
 }

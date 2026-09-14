@@ -1,14 +1,22 @@
 /**
- * Preflight: first-run requires page 1 blank; refresh allows any page.
+ * Preflight: detect refresh vs initial; first run works from any page.
  */
 
 import {PluginCommAPI, PluginFileAPI} from 'sn-plugin-lib';
 import {log} from '../utils/debug';
-import {toHostPageIndex} from '../utils/pageIndex';
-import {isPageBlankAfterIndexBot, pageHasIndexBotToc} from './tocMarkers';
+import {
+  filePageToHost,
+  filePageIndices,
+  toHostPageIndex,
+} from '../utils/pageIndex';
+import {
+  analyzeIndexBotTocPage,
+  isPageBlankAfterIndexBot,
+} from './tocMarkers';
 
 const TAG = 'Preflight';
-const TOC_PAGE = 1;
+const DEFAULT_TOC_HOST_PAGE = 1;
+const MAX_TOC_PROBE = 4;
 
 function withTimeout(promise, ms, label) {
   return new Promise((resolve, reject) => {
@@ -29,18 +37,75 @@ function withTimeout(promise, ms, label) {
   });
 }
 
-export async function detectExistingToc(notePath) {
-  const page = toHostPageIndex(TOC_PAGE);
+async function getPageElements(notePath, filePage) {
   const res = await withTimeout(
-    PluginFileAPI.getElements(page, notePath),
+    PluginFileAPI.getElements(filePage, notePath),
     15000,
-    'getElements(detectToc)',
+    `getElements(detect file=${filePage})`,
   );
   if (!res?.success || !Array.isArray(res.result)) {
-    log(TAG, `detectExistingToc failed: ${JSON.stringify(res?.error)}`);
+    return null;
+  }
+  return res.result;
+}
+
+function probeFilePages(pageCount) {
+  const pages = filePageIndices(Math.min(Math.max(1, pageCount), MAX_TOC_PROBE));
+  if (!pages.length) return [0];
+  return pages;
+}
+
+/**
+ * Scan early file pages for IndexBot ToC markers.
+ * @returns {{ found: boolean, filePage: number|null, hostPage: number|null, hasHeader: boolean, orphanLinksOnly: boolean }}
+ */
+export async function detectExistingToc(notePath, pageCount = 2) {
+  for (const filePage of probeFilePages(pageCount)) {
+    try {
+      const elements = await getPageElements(notePath, filePage);
+      if (!elements) continue;
+      const info = analyzeIndexBotTocPage(elements);
+      if (info.found) {
+        const hostPage = filePageToHost(filePage);
+        log(
+          TAG,
+          `detectExistingToc file=${filePage} host=${hostPage} header=${info.hasHeader} orphanLinks=${info.orphanLinksOnly} links=${info.linkCount}`,
+        );
+        return {
+          found: true,
+          filePage,
+          hostPage,
+          hasHeader: info.hasHeader,
+          orphanLinksOnly: info.orphanLinksOnly,
+          linkCount: info.linkCount,
+        };
+      }
+    } catch (e) {
+      log(TAG, `detectExistingToc file=${filePage} failed: ${e.message}`);
+    }
+  }
+  log(TAG, 'detectExistingToc not found on early pages');
+  return {
+    found: false,
+    filePage: null,
+    hostPage: null,
+    hasHeader: false,
+    orphanLinksOnly: false,
+    linkCount: 0,
+  };
+}
+
+async function page1LooksBlank(notePath, pageCount) {
+  const filePage0 = 0;
+  try {
+    const elements = await getPageElements(notePath, filePage0);
+    if (!elements) return true;
+    if (analyzeIndexBotTocPage(elements).found) return false;
+    return isPageBlankAfterIndexBot(elements);
+  } catch (e) {
+    log(TAG, `page blank check failed: ${e.message}`);
     return false;
   }
-  return pageHasIndexBotToc(res.result);
 }
 
 export async function checkInsertPage() {
@@ -57,7 +122,6 @@ export async function checkInsertPage() {
         mode: 'initial',
         hasExistingToc: false,
         currentPage: 1,
-        isPage1: false,
         isBlank: false,
         notePath: '',
         message: 'Open a NOTE file first.',
@@ -70,50 +134,62 @@ export async function checkInsertPage() {
       'getCurrentPageNum',
     );
     const currentPage = toHostPageIndex(pn?.result ?? pn);
-    const hasExistingToc = await detectExistingToc(notePath);
 
-    if (hasExistingToc) {
+    let pageCount = 1;
+    try {
+      const totalRes = await withTimeout(
+        PluginFileAPI.getNoteTotalPageNum(notePath),
+        8000,
+        'getNoteTotalPageNum',
+      );
+      pageCount = toHostPageIndex(totalRes?.result ?? totalRes ?? 1);
+    } catch {
+      // keep default
+    }
+
+    const tocDetect = await detectExistingToc(notePath, pageCount);
+
+    if (tocDetect.found) {
+      const headerOnly =
+        tocDetect.hasHeader &&
+        (tocDetect.linkCount ?? 0) === 0 &&
+        !tocDetect.orphanLinksOnly;
+      const msg = tocDetect.orphanLinksOnly
+        ? 'Ready — will rebuild ToC on page 1 (orphan links detected)'
+        : headerOnly
+          ? 'Ready — will rebuild incomplete ToC on page 1'
+          : 'Ready — will refresh ToC on page 1';
       return {
         ready: true,
         mode: 'refresh',
         hasExistingToc: true,
+        detectedTocFilePage: tocDetect.filePage,
+        detectedTocHostPage: tocDetect.hostPage ?? DEFAULT_TOC_HOST_PAGE,
+        orphanLinksOnly: tocDetect.orphanLinksOnly,
         currentPage,
-        isPage1: currentPage === TOC_PAGE,
         isBlank: false,
         notePath,
-        message: 'Ready — will refresh ToC on page 1',
+        pageCount,
+        message: msg,
       };
     }
 
-    const pageRes = await withTimeout(
-      PluginFileAPI.getElements(TOC_PAGE, notePath),
-      15000,
-      'getElements(page1)',
-    );
-    const elements =
-      pageRes?.success && Array.isArray(pageRes.result) ? pageRes.result : [];
-    const isPage1 = currentPage === TOC_PAGE;
-    const isBlank = isPageBlankAfterIndexBot(elements);
-
-    let message = '';
-    let ready = false;
-    if (!isPage1) {
-      message = `You are on page ${currentPage}. Go to page 1 first.`;
-    } else if (!isBlank) {
-      message = 'Page 1 has content. Clear it or use a blank page.';
-    } else {
-      message = 'Ready — page 1 is blank';
-      ready = true;
-    }
+    const isBlank = await page1LooksBlank(notePath, pageCount);
+    const message = isBlank
+      ? 'Ready — ToC will be written on page 1'
+      : 'Ready — a blank page 1 will be added automatically for the ToC';
 
     return {
-      ready,
+      ready: true,
       mode: 'initial',
       hasExistingToc: false,
+      detectedTocFilePage: null,
+      detectedTocHostPage: DEFAULT_TOC_HOST_PAGE,
+      orphanLinksOnly: false,
       currentPage,
-      isPage1,
       isBlank,
       notePath,
+      pageCount,
       message,
     };
   } catch (e) {
@@ -123,7 +199,6 @@ export async function checkInsertPage() {
       mode: 'initial',
       hasExistingToc: false,
       currentPage: 1,
-      isPage1: false,
       isBlank: false,
       notePath: '',
       message: e.message || 'Could not check page.',
@@ -135,16 +210,8 @@ export function assertInsertPageReady(checkResult) {
   if (!checkResult?.notePath) {
     throw new Error('Could not get current note path. Open a NOTE file first.');
   }
-  if (checkResult.mode === 'refresh') {
-    return checkResult;
-  }
-  if (!checkResult.isPage1) {
-    throw new Error(
-      `You are on page ${checkResult.currentPage}. Go to page 1 first.`,
-    );
-  }
-  if (!checkResult.isBlank) {
-    throw new Error('Page 1 has content. Clear it or use a blank page.');
+  if (!checkResult.ready && checkResult.mode !== 'refresh') {
+    throw new Error(checkResult.message || 'Could not prepare note for ToC.');
   }
   return checkResult;
 }
